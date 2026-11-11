@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.meetingstatus</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DIR__/.venv/bin/python</string>
+        <string>__DIR__/meeting_status.py</string>
+        <string>--config</string>
+        <string>__DIR__/config.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Do not let a crash-loop spin: wait 10s between restarts. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/meeting-status.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/meeting-status.log</string>
+
+    <!-- Low priority: this is a status light, not real work. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

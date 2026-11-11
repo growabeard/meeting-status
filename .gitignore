@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local, machine-specific config - config.example.json is the tracked template
+config.json
+
+# Generated from meeting-status.plist.template by install-agent.sh
+local.meetingstatus.plist
+*.log
+
+# Dump of whatever sketch was on the board before this project
+backup/
