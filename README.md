@@ -23,10 +23,12 @@ cp config.example.json config.json
 ./.venv/bin/python meeting_status.py --probe   # run in a terminal the FIRST time
 ```
 
-Run `--probe` interactively at least once. It triggers the macOS Calendar
-permission prompt, and a launchd agent cannot display prompts — so if the
-background agent is the first thing to ask, the request is never seen and the
-calendar signal stays dead.
+`--probe` triggers the macOS Calendar permission prompt. Grant it there and
+you can see straight away whether the calendar signal works. Note that a TCC
+grant belongs to the identity of the process that asked, so granting it in a
+terminal does not grant it to the background agent — the agent asks again for
+itself on first start, and the prompt appears in your GUI session. It waits
+`auth_wait_background` seconds (25) for an answer and starts either way.
 
 Then flash the board and run it:
 
@@ -133,6 +135,7 @@ local settings stay out of the repo).
 | `meeting_app_hold` | seconds of continuous playback before that counts (20) |
 | `event_ignore` | regexes for calendar titles that are not meetings |
 | `lead_minutes` | how early `UPCOMING` starts (5) |
+| `auth_wait_background` | seconds the background agent waits for the calendar prompt (25) |
 | `heartbeat` | how often state is resent; must stay under the sketch's 20s stale timeout |
 | `use_mic` / `use_calendar` / `use_dnd` | turn whole signals off |
 
@@ -160,7 +163,9 @@ it should not count.
 tell headset playback from capture. Upgrade macOS, or set `use_mic: false` and
 drive the LED from the override file.
 
-**No calendar events ever.** Run `--probe` in a terminal and accept the prompt.
+**No calendar events ever.** Check the log for `EventKit access authorized`. If
+it says `notDetermined`, the prompt was missed — `launchctl kickstart -k
+gui/$(id -u)/local.meetingstatus` makes the agent ask again.
 Confirm the account is in Calendar.app — EventKit only sees what Calendar.app
 has. For Exchange or Microsoft 365, add it under System Settings → Internet
 Accounts.
