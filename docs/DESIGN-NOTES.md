@@ -25,9 +25,11 @@ What it reacts to, precisely:
 - **Minus known noise.** Siri, dictation and some accessibility daemons open
   the mic without a meeting; they live in `proc_ignore`.
 
-On macOS older than 14.2 the per-process API is absent and the code falls back
-to the device-wide flag, which has the headset flaw above. `--probe` reports
-which path is in use.
+On macOS older than 14.2 the per-process API is absent, and the mic signal
+switches itself off rather than fall back to the device-wide flag and its
+headset flaw. A light that lies is worse than a signal that is absent, which is
+also why the fallback code was deleted rather than left in reach. `--probe`
+reports whether the API is there.
 
 The four-character selector codes are easy to get wrong and fail silently when
 they are. The correct ones are `piri` (input running) and `piro` (output
@@ -78,6 +80,9 @@ first because it can name the meeting.
 ## Dead ends
 
 Recorded so they are not retried.
+
+Both AppleScript backends below were implemented, shipped disabled by
+default, and later deleted: ~120 lines supporting two paths that do not work.
 
 **AppleScript to Calendar.app.** Dead. Even `count of calendars` returns
 `-1712 AppleEvent timed out` after two minutes, cold or warm. This drove the

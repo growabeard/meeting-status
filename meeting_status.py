@@ -3,37 +3,38 @@
 meeting-status: watch macOS for "am I in a meeting?" and push the answer to an
 Arduino over USB serial, which drives an RGB LED.
 
-Signals used (highest confidence first):
+Signals, highest precedence first. The first one that fires wins:
 
-  1. mic       - any audio *input* device is running somewhere (CoreAudio).
-                 Covers Teams calls, Slack huddles, Zoom, Meet in a browser -
-                 anything that opens the microphone. No permissions needed.
-  2. calendar  - an event is in progress or starts soon, read from Calendar.app
-                 and/or Microsoft Outlook via AppleScript. Needs a one-time
-                 Automation permission grant (macOS will prompt).
-  3. dnd       - macOS Focus / Do Not Disturb, best effort (format varies by
-                 OS release; silently skipped when unreadable).
-  4. override  - a file you write by hand, wins over everything. Good for
-                 "I'm heads-down, leave me alone".
+  1. override  - a state you write into a file by hand, beats everything else.
+  2. mic       - a process is *capturing* audio, via CoreAudio's per-process
+                 API. Catches Teams, Zoom, Meet and Slack huddles without
+                 knowing anything about those apps. Needs no permissions.
+  3. calendar  - an event is in progress, read from the calendar database via
+                 EventKit. Needs a one-time Calendar grant.
+  4. app audio - a known meeting app has been *playing* audio for a while.
+                 Catches the listen-only webinar the mic signal cannot see.
+  5. dnd       - macOS Focus / Do Not Disturb, best effort (the file moves
+                 between OS releases; silently skipped when unreadable).
+  6. calendar  - an event starts within lead_minutes.
 
-Resolved states, highest precedence first:
+Resolved states:
 
-  MEETING   mic is live, or a calendar event is happening right now
-  BUSY      Focus/DND is on
-  UPCOMING  a calendar event starts within `lead_minutes`
+  MEETING   capturing audio, an event is on now, or a meeting app is playing
+  BUSY      Focus / DND is on
+  UPCOMING  an event starts within lead_minutes
   FREE      none of the above
+  OFF       sent on shutdown, and settable by hand
 
 Usage:
   meeting_status.py                 run the daemon
-  meeting_status.py --probe         show audio devices + what each signal says
+  meeting_status.py --probe         show every signal and what it says
   meeting_status.py --once          print the resolved status and exit
   meeting_status.py --no-serial     run the detection loop without an Arduino
   meeting_status.py --send MEETING  force a state onto the LED and exit
 """
 
-from __future__ import annotations
-
 import argparse
+import collections
 import ctypes
 import ctypes.util
 import glob
@@ -41,7 +42,6 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -65,12 +65,6 @@ DEFAULT_CONFIG = {
     "calendar_poll": 60.0,
     "heartbeat": 5.0,
     # Calendar.
-    # "eventkit" reads the real calendar database through EventKit and is the
-    # one that works. "calendar" and "outlook" are AppleScript fallbacks kept
-    # for machines where EventKit access is refused; on current macOS
-    # Calendar.app tends not to answer AppleScript at all (-1712) and the new
-    # Outlook has no AppleScript support, so neither is enabled by default.
-    "calendar_backends": ["eventkit"],
     "lead_minutes": 5,
     # Events whose title matches any of these regexes are ignored (case
     # insensitive). All-day events are always ignored.
@@ -78,17 +72,6 @@ DEFAULT_CONFIG = {
     # deadline reminders Outlook users tend to park on the calendar as Busy.
     "event_ignore": ["^focus", "^lunch", "^hold\\b", "block", "no meeting",
                      "\\bdue\\b", "\\bwalk time\\b", "^ooo\\b", "^pto\\b"],
-    # Audio input devices to ignore - virtual/loopback devices that report
-    # themselves as running all the time. Substring match, case insensitive.
-    "mic_ignore": [
-        "zoomaudiodevice",
-        "blackhole",
-        "loopback",
-        "soundflower",
-        "krisp",
-        "vb-cable",
-        "microsoft teams audio",
-    ],
     # Processes that may legitimately hold the microphone without it meaning
     # you are in a meeting. Substring match on the bundle id, case insensitive.
     "proc_ignore": [
@@ -172,12 +155,7 @@ def _fourcc(s):
 
 
 _SYS_OBJ = 1
-_P_DEVICES = _fourcc("dev#")   # kAudioHardwarePropertyDevices
-_P_STREAMS = _fourcc("stm#")   # kAudioDevicePropertyStreams
-_P_RUNNING = _fourcc("gone")   # kAudioDevicePropertyDeviceIsRunningSomewhere
-_P_NAME = _fourcc("lnam")      # kAudioObjectPropertyName
 _S_GLOBAL = _fourcc("glob")
-_S_INPUT = _fourcc("inpt")
 
 # Per-process audio objects, macOS 14.2+. These selectors are easy to get
 # wrong: input/output are 'piri'/'piro', verified against live playback.
@@ -190,31 +168,31 @@ _ELEM_MAIN = 0
 _CF_UTF8 = 0x08000100
 
 
+AudioState = collections.namedtuple(
+    "AudioState", "capturing meeting_app candidates rows")
+
+
 class MicWatcher:
-    """Reports whether anything is actually capturing audio right now.
+    """Reports what audio is doing right now, via CoreAudio's per-process API.
 
-    Two strategies, because the obvious one is wrong:
+    CoreAudio exposes one audio object per process, each carrying
+    kAudioProcessPropertyIsRunningInput/Output, so we can ask "is anything
+    capturing?" and name the culprit by bundle id.
 
-    Preferred - the per-process API (macOS 14.2+). CoreAudio exposes one audio
-    object per process with kAudioProcessPropertyIsRunningInput, so we can ask
-    "is any process capturing?" and get the bundle id of the culprit.
+    The obvious alternative is wrong, and this used to use it: per-device
+    kAudioDevicePropertyDeviceIsRunningSomewhere. A USB or Bluetooth headset is
+    a SINGLE audio device carrying both input and output streams, and that
+    property is device-wide with no input scope - so playing music through a
+    headset marks the device as running and read as a meeting. There is no way
+    to tell capture from playback that way, which is why this needs macOS 14.2
+    or newer and switches the mic signal off rather than guess on older ones.
 
-    Fallback - per-device kAudioDevicePropertyDeviceIsRunningSomewhere. This is
-    what this script used to do, and it is subtly broken for anyone wearing a
-    USB or Bluetooth headset: such a headset is a SINGLE audio device carrying
-    both input and output streams, and that property is device-wide with no
-    input scope. Playing music through the headset marks the device as running
-    and the old code called it a meeting. Only used when the process API is
-    unavailable, and it is no more accurate there than it ever was.
-
-    Neither strategy cares about microphone permission or whether a mic is
-    merely plugged in. Connecting a headset adds an idle device; an app holding
-    mic permission but not recording does not register. Capture has to be live.
+    It cares about capture being live, not about permission or hardware: an app
+    holding mic permission without recording does not register, and connecting
+    a headset only adds an idle device.
     """
 
-    def __init__(self, ignore=(), proc_ignore=(), meeting_apps=(),
-                 app_hold=20.0):
-        self.ignore = [s.lower() for s in ignore]
+    def __init__(self, proc_ignore=(), meeting_apps=(), app_hold=20.0):
         self.proc_ignore = [s.lower() for s in proc_ignore]
         self.meeting_apps = []
         for pat in meeting_apps:
@@ -320,148 +298,44 @@ class MicWatcher:
                 continue
         return out
 
-    # -- per-device view (fallback, and useful diagnostics) --
-
-    def _is_input(self, dev):
-        return bool(self._size(dev, _P_STREAMS, _S_INPUT))
-
-    def inputs(self):
-        """[(name, device_running, ignored)] for every audio input device.
-
-        device_running is the device-wide flag, so on a headset it goes true
-        for playback too. Shown in --probe for diagnosis; not trusted for the
-        decision unless the process API is missing.
-        """
-        out = []
-        if not self.available:
-            return out
-        for dev in self._object_list(_P_DEVICES):
-            try:
-                if not self._is_input(dev):
-                    continue
-                name = self._cfstring(dev, _P_NAME) or "<unknown>"
-                ignored = any(s in name.lower() for s in self.ignore)
-                out.append((name, bool(self._flag(dev, _P_RUNNING)), ignored))
-            except OSError:
-                continue
-        return out
-
     # -- the decision --
 
-    def active(self):
-        """Name of whatever is capturing audio, or None."""
-        if not self.available:
-            return None
-        if self.process_api:
-            for name, capturing, _playing, ignored in self.processes():
-                if capturing and not ignored:
-                    return name
-            return None
-        for name, running, ignored in self.inputs():
-            if running and not ignored:
-                return name
-        return None
+    def snapshot(self):
+        """Everything the mic signal needs, from one pass over the processes.
 
-    def meeting_audio(self):
-        """Name of a meeting app that has been playing audio long enough.
+        Capture and meeting-app playback used to be two calls, which meant two
+        full CoreAudio enumerations per poll to answer one question.
 
-        Catches the meetings the mic signal cannot see: a Zoom webinar where
-        you have no mic access, or a call where the host muted everyone. Needs
-        the per-process API - the device-wide flag cannot attribute playback
-        to an app, so this signal is simply off on older macOS.
-
-        Playback has to persist for app_hold seconds. Without that, every
+        Playback has to persist for app_hold seconds before it counts, or every
         Slack notification chime would read as a meeting.
         """
-        if not self.process_api or not self.meeting_apps:
-            return None
-        return self._meeting_scan()[0]
-
-    def meeting_candidates(self):
-        """Meeting apps playing audio right now, before the hold is applied.
-
-        Diagnostics only - a one-shot --probe has no history to debounce
-        against, so it reports candidates and lets you read the hold.
-        """
-        if not self.process_api or not self.meeting_apps:
-            return []
-        return self._meeting_scan()[1]
-
-    def _meeting_scan(self):
-        """(name past the hold or None, [all candidates])."""
+        rows = self.processes()
         now = time.time()
+        capturing = None
+        meeting_app = None
         playing_now = set()
-        hit = None
-        for name, _capturing, playing, ignored in self.processes():
-            if not playing or ignored:
+        for name, is_capturing, is_playing, ignored in rows:
+            if ignored:
+                continue
+            if is_capturing and capturing is None:
+                capturing = name
+            if not is_playing:
                 continue
             if not any(rx.search(name) for rx in self.meeting_apps):
                 continue
             playing_now.add(name)
             since = self._playing_since.setdefault(name, now)
-            if now - since >= self.app_hold and hit is None:
-                hit = name
+            if now - since >= self.app_hold and meeting_app is None:
+                meeting_app = name
         # Forget apps that have stopped, so the next burst starts its own clock.
         for name in [n for n in self._playing_since if n not in playing_now]:
             del self._playing_since[name]
-        return hit, sorted(playing_now)
+        return AudioState(capturing, meeting_app, sorted(playing_now), rows)
 
 
 # --------------------------------------------------------------------------
-# Signal 2: calendar, via AppleScript
+# Signal 2: calendar, via EventKit
 # --------------------------------------------------------------------------
-
-# Both scripts take lead-seconds as argv[1] and print one line per relevant
-# event: "title \t seconds_until_start \t seconds_until_end". Deltas are
-# computed inside AppleScript so there is no date parsing or locale guessing.
-
-SCRIPT_CALENDAR = r'''
-on run argv
-    set leadSecs to (item 1 of argv) as integer
-    set nowD to (current date)
-    set endD to nowD + leadSecs
-    set out to ""
-    tell application "Calendar"
-        repeat with cal in calendars
-            try
-                set evs to (every event of cal whose allday event is false and start date < endD and end date > nowD)
-                repeat with e in evs
-                    try
-                        set s to (((start date of e) - nowD) as integer)
-                        set f to (((end date of e) - nowD) as integer)
-                        set out to out & (summary of e) & tab & s & tab & f & linefeed
-                    end try
-                end repeat
-            end try
-        end repeat
-    end tell
-    return out
-end run
-'''
-
-SCRIPT_OUTLOOK = r'''
-on run argv
-    set leadSecs to (item 1 of argv) as integer
-    set nowD to (current date)
-    set endD to nowD + leadSecs
-    set out to ""
-    tell application "Microsoft Outlook"
-        set evs to (every calendar event whose start time < endD and end time > nowD)
-        repeat with e in evs
-            try
-                if (all day flag of e) is false then
-                    set s to (((start time of e) - nowD) as integer)
-                    set f to (((end time of e) - nowD) as integer)
-                    set out to out & (subject of e) & tab & s & tab & f & linefeed
-                end if
-            end try
-        end repeat
-    end tell
-    return out
-end run
-'''
-
-BACKEND_SCRIPTS = {"calendar": SCRIPT_CALENDAR, "outlook": SCRIPT_OUTLOOK}
 
 
 # EventKit authorization status codes, for readable diagnostics.
@@ -484,10 +358,10 @@ class EventKitSource:
     account Calendar.app knows about, Exchange/Outlook included, with none of
     the AppleEvent timeouts the AppleScript route suffers from.
 
-    macOS will prompt for calendar access the first time. The prompt is
-    attributed to the Python binary running this, so grant it once from a
-    terminal before handing the job to launchd - a prompt raised by a launchd
-    agent is easy to miss and the request just times out.
+    macOS prompts for calendar access the first time. The grant belongs to the
+    identity of the process that asked, so granting it in a terminal does not
+    grant it to the launchd agent - the agent has to ask for itself, which it
+    can, being a user agent in the GUI session.
     """
 
     def __init__(self):
@@ -563,14 +437,11 @@ class EventKitSource:
                 self._ek.EKEntityTypeEvent, handler
             )
 
-        try:
-            from Foundation import NSRunLoop, NSDate as _NSDate
-            loop = NSRunLoop.currentRunLoop()
-            deadline = time.monotonic() + wait
-            while not done.is_set() and time.monotonic() < deadline:
-                loop.runUntilDate_(_NSDate.dateWithTimeIntervalSinceNow_(0.25))
-        except ImportError:
-            done.wait(wait)
+        from Foundation import NSRunLoop
+        loop = NSRunLoop.currentRunLoop()
+        deadline = time.monotonic() + wait
+        while not done.is_set() and time.monotonic() < deadline:
+            loop.runUntilDate_(self._nsdate.dateWithTimeIntervalSinceNow_(0.25))
 
         if not done.is_set():
             self.error = ("no answer to the calendar permission prompt within "
@@ -629,17 +500,16 @@ EVENTKIT = EventKitSource()
 
 
 class CalendarWatcher:
-    """Polls calendars on a background thread; main loop reads cached state."""
+    """Polls EventKit on a background thread; the main loop reads the cache."""
 
-    def __init__(self, backends, lead_minutes, ignore, poll, verbose=False):
-        self.backends = list(backends)
+    def __init__(self, lead_minutes, ignore, poll, verbose=False):
         self.lead = int(lead_minutes) * 60
         self.ignore = [re.compile(p, re.I) for p in ignore]
         self.poll = poll
         self.verbose = verbose
-        self.failures = {b: 0 for b in self.backends}
+        self.failures = 0
         self._lock = threading.Lock()
-        self._current = None   # title of event in progress
+        self._current = None   # title of the event in progress
         self._next = None      # (title, seconds_until_start)
         self._stop = threading.Event()
         self._thread = None
@@ -659,51 +529,26 @@ class CalendarWatcher:
                 log("calendar: %s" % exc)
             self._stop.wait(self.poll)
 
-    def _query(self, backend):
-        if backend == "eventkit":
-            return [e for e in EVENTKIT.events(self.lead)
-                    if not any(rx.search(e[0]) for rx in self.ignore)]
-        script = BACKEND_SCRIPTS[backend]
-        proc = subprocess.run(
-            ["osascript", "-", str(self.lead)],
-            input=script, capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or "osascript failed").strip())
-        events = []
-        for line in proc.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            title = parts[0].strip()
-            try:
-                start, end = int(parts[1]), int(parts[2])
-            except ValueError:
-                continue
-            if any(rx.search(title) for rx in self.ignore):
-                continue
-            events.append((title, start, end))
-        return events
-
     def refresh(self):
-        events = []
-        for backend in list(self.backends):
-            try:
-                events.extend(self._query(backend))
-                self.failures[backend] = 0
-            except Exception as exc:
-                self.failures[backend] += 1
-                log("calendar backend %r failed (%d): %s"
-                    % (backend, self.failures[backend], exc))
-                if self.failures[backend] >= 3:
-                    log("calendar backend %r disabled" % backend)
-                    self.backends.remove(backend)
+        try:
+            events = [e for e in EVENTKIT.events(self.lead)
+                      if not any(rx.search(e[0]) for rx in self.ignore)]
+        except Exception as exc:
+            self.failures += 1
+            log("calendar: read failed (%d): %s" % (self.failures, exc))
+            # Keep the last good answer. Blanking it here would drop the light
+            # to FREE mid-meeting on one transient error, and the old code also
+            # disabled the calendar permanently after three - which, with one
+            # backend, meant three blips killed the signal until a restart.
+            return
+        self.failures = 0
 
         current = None
         upcoming = None
         for title, start, end in events:
             if start <= 0 < end:
-                current = title if current is None else current
+                if current is None:
+                    current = title
             elif 0 < start <= self.lead:
                 if upcoming is None or start < upcoming[1]:
                     upcoming = (title, start)
@@ -779,21 +624,19 @@ def resolve(cfg, mic, cal):
     if forced:
         return forced, "override file"
 
-    if cfg["use_mic"] and mic is not None:
-        name = mic.active()
-        if name:
-            return "MEETING", "mic in use (%s)" % name
+    audio = mic.snapshot() if mic is not None else None
+    if audio and audio.capturing:
+        return "MEETING", "mic in use (%s)" % audio.capturing
 
     current = nxt = None
-    if cfg["use_calendar"] and cal is not None:
+    if cal is not None:
         current, nxt = cal.state()
     if current:
         return "MEETING", "calendar: %s" % current
 
-    if cfg["use_mic"] and mic is not None:
-        name = mic.meeting_audio()
-        if name:
-            return "MEETING", "meeting app audio (%s)" % name
+    # Ranked below the calendar so a named meeting gives the better reason.
+    if audio and audio.meeting_app:
+        return "MEETING", "meeting app audio (%s)" % audio.meeting_app
 
     if cfg["use_dnd"] and dnd_active():
         return "BUSY", "do not disturb"
@@ -888,36 +731,77 @@ class SerialLink:
 # --------------------------------------------------------------------------
 
 
+def build_mic(cfg):
+    """A MicWatcher, or None when the mic signal cannot or should not run."""
+    if not cfg["use_mic"]:
+        return None
+    mic = MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
+                     cfg["meeting_app_hold"])
+    if not mic.available:
+        log("mic: CoreAudio unavailable, mic signal off")
+        return None
+    if not mic.process_api:
+        log("mic: no per-process audio API (needs macOS 14.2 or newer), "
+            "mic signal off")
+        return None
+    return mic
+
+
+def build_calendar(cfg):
+    """A CalendarWatcher, not yet started, or None. Call on the main thread.
+
+    The permission prompt is presented on the main run loop, so asking has to
+    happen here rather than lazily from the polling thread.
+
+    A TCC grant is tied to the identity of the process that asked, so a grant
+    given to a terminal run does not carry over to the launchd agent - the
+    agent asks for itself. It can: a user agent runs in the GUI session. What
+    it cannot do is wait two minutes for someone to notice the prompt, so the
+    background wait is short and startup carries on regardless. The mic signal
+    needs no permission and works meanwhile.
+    """
+    if not cfg["use_calendar"]:
+        return None
+    if EVENTKIT.authorized():
+        log("calendar: EventKit access %s" % EVENTKIT.status_name())
+    else:
+        interactive = sys.stdin.isatty()
+        wait = cfg["auth_wait"] if interactive else cfg["auth_wait_background"]
+        if EVENTKIT.request_access(wait=wait):
+            log("calendar: EventKit access %s" % EVENTKIT.status_name())
+        elif interactive:
+            log("calendar: %s" % EVENTKIT.error)
+        else:
+            log("calendar: EventKit access is %s after asking for %gs - if no "
+                "prompt appeared, run --probe in a terminal; the calendar "
+                "signal is off until it is granted"
+                % (EVENTKIT.status_name(), wait))
+    return CalendarWatcher(cfg["lead_minutes"], cfg["event_ignore"],
+                           cfg["calendar_poll"], verbose=cfg["verbose"])
+
+
 def cmd_probe(cfg):
-    mic = MicWatcher(cfg["mic_ignore"], cfg["proc_ignore"],
-                     cfg["meeting_apps"], cfg["meeting_app_hold"])
+    mic = MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
+                     cfg["meeting_app_hold"])
     print("CoreAudio available: %s" % mic.available)
     print("Per-process capture API: %s"
           % ("yes" if mic.process_api
-             else "NO - falling back to the device flag, which counts "
-                  "headset playback as capture"))
+             else "NO - needs macOS 14.2 or newer; the mic signal is off"))
 
-    if mic.process_api:
-        print("\nProcesses using audio (capture is what decides):")
-        rows = [r for r in mic.processes() if r[1] or r[2]]
-        if not rows:
-            print("  (nothing playing or capturing)")
-        for name, capturing, playing, ignored in rows:
-            print("  %s %s  %s%s" % ("CAPTURING" if capturing else "         ",
-                                     "playing" if playing else "       ",
-                                     name,
-                                     "   (ignored)" if ignored else ""))
+    audio = mic.snapshot()
+    print("\nProcesses using audio (capture is what decides):")
+    rows = [r for r in audio.rows if r[1] or r[2]]
+    if not rows:
+        print("  (nothing playing or capturing)")
+    for name, capturing, playing, ignored in rows:
+        print("  %s %s  %s%s" % ("CAPTURING" if capturing else "         ",
+                                 "playing" if playing else "       ",
+                                 name,
+                                 "   (ignored)" if ignored else ""))
 
-    print("\nAudio input devices (device-wide flag, headsets go true on "
-          "playback too):")
-    for name, running, ignored in mic.inputs():
-        flag = "running" if running else "idle   "
-        print("  %s  %s%s" % (flag, name, "   (ignored)" if ignored else ""))
-
-    print("\nmic active: %r" % mic.active())
-    cands = mic.meeting_candidates()
-    print("meeting apps playing: %s  (counts after %gs of continuous playback)"
-          % (", ".join(cands) if cands else "none", mic.app_hold))
+    print("\nmic active: %r" % audio.capturing)
+    print("meeting apps playing: %s  (counts after %gs of continuous "
+          "playback)" % (", ".join(audio.candidates) or "none", mic.app_hold))
 
     print("\nFocus / DND: %r  (None = not readable on this macOS)"
           % dnd_active())
@@ -927,71 +811,28 @@ def cmd_probe(cfg):
     print("\nEventKit calendar access: %s" % EVENTKIT.status_name())
     if not EVENTKIT.authorized():
         print("Requesting access - a system prompt should appear now...")
-        EVENTKIT.request_access(wait=120.0)
+        EVENTKIT.request_access(wait=cfg["auth_wait"])
         print("EventKit calendar access: %s" % EVENTKIT.status_name())
 
-    cal = CalendarWatcher(cfg["calendar_backends"], cfg["lead_minutes"],
-                          cfg["event_ignore"], cfg["calendar_poll"],
-                          verbose=True)
-    print("Backends: %s" % ", ".join(cfg["calendar_backends"]))
-    print("Querying calendars (first run raises a permission prompt - "
-          "click Allow)...")
+    cal = CalendarWatcher(cfg["lead_minutes"], cfg["event_ignore"],
+                          cfg["calendar_poll"], verbose=True)
+    print("Querying the calendar...")
     cal.refresh()
     print("  in progress: %r" % (cal.state()[0],))
     print("  next:        %r" % (cal.state()[1],))
     if EVENTKIT.error:
         print("  eventkit: %s" % EVENTKIT.error)
 
-    state, reason = resolve(cfg, mic, cal)
+    state, reason = resolve(cfg, mic if cfg["use_mic"] else None, cal)
     print("\n=> %s  (%s)" % (state, reason))
-
-    link = SerialLink(cfg)
-    print("\nSerial port: %r" % link.find_port())
+    print("\nSerial port: %r" % SerialLink(cfg).find_port())
 
 
 def run_daemon(cfg, use_serial=True):
-    mic = (MicWatcher(cfg["mic_ignore"], cfg["proc_ignore"],
-                      cfg["meeting_apps"], cfg["meeting_app_hold"])
-           if cfg["use_mic"] else None)
-    if mic is not None and not mic.available:
-        log("mic: CoreAudio unavailable, mic signal disabled")
-        mic = None
-
-    cal = None
-    if cfg["use_calendar"] and cfg["calendar_backends"]:
-        if "eventkit" in cfg["calendar_backends"]:
-            # Main thread, before the polling thread exists: the permission
-            # prompt needs this run loop.
-            #
-            # Ask either way, but wait differently. A TCC grant is tied to the
-            # asking process's identity, and a launchd agent does not inherit
-            # the one a terminal run was granted under - so "already granted in
-            # a terminal" does not make the agent authorized, and the agent has
-            # to ask for itself. A *user* agent runs in the GUI session and can
-            # present the prompt; what it cannot do is wait two minutes for
-            # someone to notice it, so the non-interactive wait is short and
-            # startup carries on either way. The mic signal needs no permission
-            # and works meanwhile.
-            interactive = sys.stdin.isatty()
-            if EVENTKIT.authorized():
-                log("calendar: EventKit access %s" % EVENTKIT.status_name())
-            else:
-                wait = cfg.get("auth_wait", 120.0) if interactive \
-                    else cfg.get("auth_wait_background", 25.0)
-                if EVENTKIT.request_access(wait=wait):
-                    log("calendar: EventKit access %s" % EVENTKIT.status_name())
-                elif interactive:
-                    log("calendar: %s" % EVENTKIT.error)
-                else:
-                    log("calendar: EventKit access is %s after asking for %gs "
-                        "- if no prompt appeared, run --probe in a terminal; "
-                        "the calendar signal is off until it is granted"
-                        % (EVENTKIT.status_name(), wait))
-        cal = CalendarWatcher(cfg["calendar_backends"], cfg["lead_minutes"],
-                              cfg["event_ignore"], cfg["calendar_poll"],
-                              verbose=cfg["verbose"])
+    mic = build_mic(cfg)
+    cal = build_calendar(cfg)
+    if cal is not None:
         cal.start()
-
     link = SerialLink(cfg) if use_serial else None
 
     stop = threading.Event()
@@ -1016,17 +857,16 @@ def run_daemon(cfg, use_serial=True):
         state, reason = resolve(cfg, mic, cal)
         now = time.monotonic()
         changed = state != last_state
-        due = now - last_sent >= cfg["heartbeat"]
         if changed:
             log("%s  <- %s" % (state, reason))
-        elif reason != last_reason and cfg.get("verbose"):
+        elif reason != last_reason and cfg["verbose"]:
             # Same state, new cause. Worth a line: it is the only way to tell
             # "still red because the mic is open" from "still red because the
             # calendar says so", which matters when you are working out why
             # the light will not go green.
             log("%s  .. %s" % (state, reason))
         last_reason = reason
-        if link and (changed or due):
+        if link and (changed or now - last_sent >= cfg["heartbeat"]):
             if link.send(state):
                 last_sent = now
         last_state = state
@@ -1072,16 +912,9 @@ def main(argv=None):
         return 0
 
     if args.once:
-        mic = (MicWatcher(cfg["mic_ignore"], cfg["proc_ignore"],
-                          cfg["meeting_apps"], cfg["meeting_app_hold"])
-               if cfg["use_mic"] else None)
-        cal = None
-        if cfg["use_calendar"]:
-            if "eventkit" in cfg["calendar_backends"]:
-                EVENTKIT.request_access(wait=120.0)
-            cal = CalendarWatcher(cfg["calendar_backends"],
-                                  cfg["lead_minutes"], cfg["event_ignore"],
-                                  cfg["calendar_poll"])
+        mic = build_mic(cfg)
+        cal = build_calendar(cfg)
+        if cal is not None:
             cal.refresh()
         state, reason = resolve(cfg, mic, cal)
         print("%s  (%s)" % (state, reason))

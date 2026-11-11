@@ -1,20 +1,29 @@
 {
   "_comment": "Copy to config.json and edit. Every key is optional; anything you leave out uses the default in meeting_status.py.",
-
   "port": null,
   "baud": 115200,
-
   "mic_poll": 2.0,
   "calendar_poll": 60.0,
   "heartbeat": 5.0,
-
-  "calendar_backends": ["eventkit"],
   "lead_minutes": 5,
-  "event_ignore": ["^focus", "^lunch", "^hold\\b", "block", "no meeting", "\\bdue\\b", "\\bwalk time\\b", "^ooo\\b", "^pto\\b"],
-
-  "mic_ignore": ["zoomaudiodevice", "blackhole", "loopback", "krisp", "microsoft teams audio"],
-  "proc_ignore": ["com.apple.corespeech", "com.apple.assistantd", "com.apple.accessibility.heard", "com.apple.universalaccessd", "com.apple.controlcenter"],
-
+  "event_ignore": [
+    "^focus",
+    "^lunch",
+    "^hold\\b",
+    "block",
+    "no meeting",
+    "\\bdue\\b",
+    "\\bwalk time\\b",
+    "^ooo\\b",
+    "^pto\\b"
+  ],
+  "proc_ignore": [
+    "com.apple.corespeech",
+    "com.apple.assistantd",
+    "com.apple.accessibility.heard",
+    "com.apple.universalaccessd",
+    "com.apple.controlcenter"
+  ],
   "meeting_apps": [
     "us\\.zoom\\.",
     "com\\.microsoft\\.teams",
@@ -26,7 +35,6 @@
   "use_mic": true,
   "use_calendar": true,
   "use_dnd": true,
-
   "override_file": "~/.meeting-status",
   "verbose": false
 }

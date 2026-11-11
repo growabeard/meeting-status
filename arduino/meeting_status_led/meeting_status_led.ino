@@ -67,7 +67,7 @@ uint8_t brightness = 255;               // global scale, 0..255
 
 // ---- states --------------------------------------------------------------
 
-enum Effect { SOLID, BREATHE_SLOW, BREATHE_FAST };
+enum Effect { SOLID, BREATHE_SLOW };
 
 struct Status {
   const char *name;
@@ -108,8 +108,6 @@ unsigned long lastFadeMs = 0;
 
 char line[48];
 uint8_t lineLen = 0;
-
-// ---- helpers -------------------------------------------------------------
 
 // ---- SOFT PWM ------------------------------------------------------------
 //
@@ -187,9 +185,9 @@ void stepToward(uint8_t &value, uint8_t target) {
 void render() {
   uint8_t mod = 255;
   if (!manual) {
-    Effect e = STATUSES[stale ? IDX_STALE : currentIdx].effect;
-    if (e == BREATHE_SLOW)      mod = breathe(4000);
-    else if (e == BREATHE_FAST) mod = breathe(1200);
+    if (STATUSES[stale ? IDX_STALE : currentIdx].effect == BREATHE_SLOW) {
+      mod = breathe(4000);
+    }
   }
   uint8_t gain = scale(mod, brightness);
   writeChannel(PIN_R, scale(curR, gain));

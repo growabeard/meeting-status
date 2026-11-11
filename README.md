@@ -163,8 +163,6 @@ local settings stay out of the repo).
 | `heartbeat` | how often state is resent; must stay under the sketch's 20s stale timeout |
 | `use_mic` / `use_calendar` / `use_dnd` | turn whole signals off |
 
-`mic_ignore` applies only to the pre-macOS-14.2 fallback path.
-
 To find the bundle id to add to `proc_ignore` or `meeting_apps`, run `--probe`
 and read the process list.
 
@@ -182,10 +180,12 @@ Identify them with `RGB 255 0 0` / `RGB 0 255 0` / `RGB 0 0 255` and swap
 look for a `CAPTURING` row; it names the bundle id. Add it to `proc_ignore` if
 it should not count.
 
-**Music through my headset turns the LED red.** `--probe` is reporting
-`Per-process capture API: no`, so the device-wide fallback is in use and cannot
-tell headset playback from capture. Upgrade macOS, or set `use_mic: false` and
-drive the LED from the override file.
+**Nothing ever goes red for a call.** Check `--probe` for
+`Per-process capture API: yes`. On macOS older than 14.2 that API does not
+exist, and the mic signal switches itself off rather than fall back to the
+device-wide flag, which cannot tell headset playback from capture and would
+turn the light red for music. Drive the LED from the calendar and the override
+file instead.
 
 **No calendar events ever.** Check the log for `EventKit access authorized`. If
 it says `notDetermined`, the prompt was missed — `launchctl kickstart -k
@@ -214,8 +214,9 @@ docs/DESIGN-NOTES.md                   why it works this way, and what does not 
 
 ## Requirements
 
-macOS 14.2 or newer for per-process audio detection (older macOS falls back to
-a less accurate device-wide check), Python 3.9+, and an ATmega328P Arduino.
+macOS 14.2 or newer for the mic signal (older releases have no per-process
+audio API; the calendar and override signals still work), Python 3.9+, and an
+ATmega328P Arduino.
 
 ## License
 
