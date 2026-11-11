@@ -119,6 +119,10 @@ DEFAULT_CONFIG = {
     "use_dnd": True,
     "override_file": "~/.meeting-status",
     "auth_wait": 120.0,
+    # Same, when running in the background with nobody at a terminal.
+    # Short on purpose: the prompt still appears on screen, but startup
+    # must not hang waiting for someone to walk past and click it.
+    "auth_wait_background": 25.0,
     "verbose": False,
 }
 
@@ -959,23 +963,30 @@ def run_daemon(cfg, use_serial=True):
             # Main thread, before the polling thread exists: the permission
             # prompt needs this run loop.
             #
-            # Only ask when a human is watching. Under launchd there is nobody
-            # to click the prompt and the system cannot present it anyway, so
-            # requesting would just stall startup for the whole timeout. In
-            # that case check the existing grant and carry on.
+            # Ask either way, but wait differently. A TCC grant is tied to the
+            # asking process's identity, and a launchd agent does not inherit
+            # the one a terminal run was granted under - so "already granted in
+            # a terminal" does not make the agent authorized, and the agent has
+            # to ask for itself. A *user* agent runs in the GUI session and can
+            # present the prompt; what it cannot do is wait two minutes for
+            # someone to notice it, so the non-interactive wait is short and
+            # startup carries on either way. The mic signal needs no permission
+            # and works meanwhile.
             interactive = sys.stdin.isatty()
             if EVENTKIT.authorized():
                 log("calendar: EventKit access %s" % EVENTKIT.status_name())
-            elif interactive:
-                if EVENTKIT.request_access(wait=cfg.get("auth_wait", 120.0)):
-                    log("calendar: EventKit access %s" % EVENTKIT.status_name())
-                else:
-                    log("calendar: %s" % EVENTKIT.error)
             else:
-                log("calendar: EventKit access is %s and nothing is attached "
-                    "to prompt on - run --probe in a terminal once to grant "
-                    "it; the calendar signal is off until then"
-                    % EVENTKIT.status_name())
+                wait = cfg.get("auth_wait", 120.0) if interactive \
+                    else cfg.get("auth_wait_background", 25.0)
+                if EVENTKIT.request_access(wait=wait):
+                    log("calendar: EventKit access %s" % EVENTKIT.status_name())
+                elif interactive:
+                    log("calendar: %s" % EVENTKIT.error)
+                else:
+                    log("calendar: EventKit access is %s after asking for %gs "
+                        "- if no prompt appeared, run --probe in a terminal; "
+                        "the calendar signal is off until it is granted"
+                        % (EVENTKIT.status_name(), wait))
         cal = CalendarWatcher(cfg["calendar_backends"], cfg["lead_minutes"],
                               cfg["event_ignore"], cfg["calendar_poll"],
                               verbose=cfg["verbose"])
