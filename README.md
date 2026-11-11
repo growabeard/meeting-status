@@ -110,7 +110,7 @@ meeting_status.py --probe         # every signal, the audio process list, resolv
 meeting_status.py --once          # print the current state and exit
 meeting_status.py --no-serial     # detection only, no Arduino
 meeting_status.py --send MEETING  # force one state onto the LED and exit
-meeting_status.py -v              # log every state evaluation
+meeting_status.py -v              # also log cause changes, not just state changes
 ```
 
 `--probe` is the diagnostic to reach for first. It prints which audio API is in

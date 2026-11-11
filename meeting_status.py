@@ -996,6 +996,7 @@ def run_daemon(cfg, use_serial=True):
         pass          # not on the main thread; caller handles shutdown
 
     last_state = None
+    last_reason = None
     last_sent = 0.0
     log("started (mic=%s calendar=%s dnd=%s serial=%s)"
         % (mic is not None, cal is not None, cfg["use_dnd"], use_serial))
@@ -1007,6 +1008,13 @@ def run_daemon(cfg, use_serial=True):
         due = now - last_sent >= cfg["heartbeat"]
         if changed:
             log("%s  <- %s" % (state, reason))
+        elif reason != last_reason and cfg.get("verbose"):
+            # Same state, new cause. Worth a line: it is the only way to tell
+            # "still red because the mic is open" from "still red because the
+            # calendar says so", which matters when you are working out why
+            # the light will not go green.
+            log("%s  .. %s" % (state, reason))
+        last_reason = reason
         if link and (changed or due):
             if link.send(state):
                 last_sent = now
