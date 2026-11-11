@@ -75,10 +75,11 @@ struct Status {
   Effect effect;
 };
 
-// Colours are pre-dimmed where a raw channel would otherwise dominate; most
-// cheap RGB LEDs are far brighter in green than in red or blue.
+// Some colours are pre-dimmed where a raw channel would otherwise dominate;
+// most cheap RGB LEDs are far brighter in green than in red or blue. FREE is
+// deliberately not dimmed - it is pure green, no red or blue mixed in.
 const Status STATUSES[] = {
-  { "FREE",     0,   180, 20,  SOLID         },  // green    - come on in
+  { "FREE",     0,   255, 0,   SOLID         },  // pure green - come on in
   { "UPCOMING", 255, 90,  0,   BREATHE_SLOW  },  // amber    - starting soon
   { "MEETING",  255, 0,   0,   SOLID         },  // red      - on a call
   { "BUSY",     150, 0,   200, SOLID         },  // purple   - focus / DND
