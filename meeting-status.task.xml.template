@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!-- Task Scheduler twin of meeting-status.plist.template. install-task.ps1
+     substitutes __DIR__, __LOG__ and __USER__ and registers the result.
+
+     Not an exact equal of the launchd agent: launchd's KeepAlive restarts the
+     job whenever it exits, while Task Scheduler only restarts it on failure.
+     A clean exit therefore stays exited until the next logon. -->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>meeting-status: drive the meeting status LED over USB serial.</Description>
+    <URI>\meeting-status</URI>
+  </RegistrationInfo>
+
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>__USER__</UserId>
+    </LogonTrigger>
+  </Triggers>
+
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <!-- Interactive, not SYSTEM: it reads this user's calendar, this user's
+           microphone privacy registry and this user's audio sessions. None of
+           those exist for a service account. -->
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <!-- A status light should keep working on battery. -->
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <!-- PT0S = run forever; the default would kill it after three days. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <!-- 7 = below normal, the ProcessType=Background equivalent. -->
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+
+  <Actions Context="Author">
+    <Exec>
+      <!-- pythonw, not python: no console window. It also means the process
+           has no stderr at all, which is why the log flag below exists. -->
+      <Command>__DIR__\.venv\Scripts\pythonw.exe</Command>
+      <Arguments>"__DIR__\meeting_status.py" --config "__DIR__\config.json" --log "__LOG__"</Arguments>
+      <WorkingDirectory>__DIR__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

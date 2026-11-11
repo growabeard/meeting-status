@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-meeting-status: watch macOS for "am I in a meeting?" and push the answer to an
-Arduino over USB serial, which drives an RGB LED.
+meeting-status: work out whether you are in a meeting and push the answer to
+an Arduino over USB serial, which drives an RGB LED.
+
+Runs on macOS and Windows. Everything platform-specific lives in
+signals_darwin.py / signals_win32.py, picked below by sys.platform; the
+signals themselves, and the order they are consulted in, are the same on both.
 
 Signals, highest precedence first. The first one that fires wins:
 
   1. override  - a state you write into a file by hand, beats everything else.
-  2. mic       - a process is *capturing* audio, via CoreAudio's per-process
-                 API. Catches Teams, Zoom, Meet and Slack huddles without
-                 knowing anything about those apps. Needs no permissions.
-  3. calendar  - an event is in progress, read from the calendar database via
-                 EventKit. Needs a one-time Calendar grant.
+  2. mic       - a process is *capturing* audio. Catches Teams, Zoom, Meet and
+                 Slack huddles without knowing anything about those apps.
+  3. calendar  - an event is in progress, read from the local calendar.
   4. app audio - a known meeting app has been *playing* audio for a while.
                  Catches the listen-only webinar the mic signal cannot see.
-  5. dnd       - macOS Focus / Do Not Disturb, best effort (the file moves
-                 between OS releases; silently skipped when unreadable).
+  5. dnd       - Focus / Do Not Disturb, best effort. Skipped silently where
+                 the OS does not expose it.
   6. calendar  - an event starts within lead_minutes.
 
 Resolved states:
@@ -34,10 +36,6 @@ Usage:
 """
 
 import argparse
-import collections
-import ctypes
-import ctypes.util
-import glob
 import json
 import os
 import re
@@ -46,6 +44,22 @@ import sys
 import threading
 import time
 
+from common import STATES, log
+
+# The platform seam. Each module provides the same handful of names; see the
+# contract in signals_darwin.py. Importing by platform rather than branching
+# inside the signals keeps the detection logic below free of OS conditionals.
+if sys.platform == "darwin":
+    import signals_darwin as signals
+elif sys.platform == "win32":
+    import signals_win32 as signals
+else:
+    raise SystemExit(
+        "meeting-status supports macOS and Windows; this is %r. The signals "
+        "are the OS-specific part - port signals_darwin.py to add another."
+        % sys.platform
+    )
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
@@ -53,11 +67,19 @@ import time
 DEFAULT_CONFIG = {
     # Serial. port=null auto-detects the first matching device.
     "port": None,
-    "port_globs": [
-        "/dev/cu.usbmodem*",
-        "/dev/cu.usbserial*",
-        "/dev/cu.wchusbserial*",
-        "/dev/cu.SLAB_USBtoUART*",
+    # Patterns tried against each serial port's "vid:pid", device name and
+    # description, case insensitively, first match wins. USB ids rather than
+    # device-path globs because the path is OS-shaped (/dev/cu.* on macOS,
+    # COM3 on Windows) while the id of the USB-serial bridge is not.
+    "port_match": [
+        "1a86:7523",      # CH340 - the usual Arduino clone bridge
+        "1a86:55d4",      # CH9102
+        "2341:",          # Arduino SA
+        "2a03:",          # Arduino.org era boards
+        "0403:6001",      # FTDI FT232R
+        "10c4:ea60",      # Silicon Labs CP210x
+        "usbmodem", "usbserial", "wchusbserial",   # macOS device names
+        "ch340", "arduino",                        # Windows descriptions
     ],
     "baud": 115200,
     # Timing, seconds.
@@ -72,26 +94,12 @@ DEFAULT_CONFIG = {
     # deadline reminders Outlook users tend to park on the calendar as Busy.
     "event_ignore": ["^focus", "^lunch", "^hold\\b", "block", "no meeting",
                      "\\bdue\\b", "\\bwalk time\\b", "^ooo\\b", "^pto\\b"],
-    # Processes that may legitimately hold the microphone without it meaning
-    # you are in a meeting. Substring match on the bundle id, case insensitive.
-    "proc_ignore": [
-        "com.apple.corespeech",            # Siri / "Hey Siri"
-        "com.apple.assistantd",
-        "com.apple.accessibility.heard",
-        "com.apple.universalaccessd",
-        "com.apple.controlcenter",
-    ],
-    # Apps whose audio *playback* means you are in a meeting, even when the
-    # mic is never opened (a listen-only Zoom webinar, a muted-by-host call).
-    # Regex, matched case insensitively against the bundle id. Browsers are
-    # deliberately absent: a browser plays everything, not just meetings.
-    "meeting_apps": [
-        r"us\.zoom\.",
-        r"com\.microsoft\.teams",
-        r"com\.tinyspeck\.slack",
-        r"webex|cisco-systems\.spark",
-        r"com\.google\.chrome\.helper\.meet",
-    ],
+    # These two name processes, and processes are named differently on each
+    # OS - bundle ids on macOS, executable names on Windows - so the defaults
+    # come from the platform module. Overriding either in config.json replaces
+    # the platform default wholesale; run --probe to see the names to use.
+    "proc_ignore": list(signals.DEFAULT_PROC_IGNORE),
+    "meeting_apps": list(signals.DEFAULT_MEETING_APPS),
     # How long a meeting app must play audio before it counts. Notification
     # chimes are a second or two; this keeps a Slack ping from reading as a
     # meeting. Raise it if stray sounds still get through.
@@ -114,9 +122,6 @@ CONFIG_SEARCH = [
     "~/.config/meeting-status/config.json",
 ]
 
-STATES = ("FREE", "UPCOMING", "BUSY", "MEETING", "OFF")
-
-
 def load_config(path=None):
     cfg = dict(DEFAULT_CONFIG)
     candidates = [path] if path else CONFIG_SEARCH
@@ -132,377 +137,20 @@ def load_config(path=None):
     return cfg
 
 
-def log(msg):
-    sys.stderr.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
-    sys.stderr.flush()
-
-
 # --------------------------------------------------------------------------
-# Signal 1: microphone in use, via CoreAudio (ctypes, no dependencies)
+# Calendar polling (platform-independent; the source is not)
 # --------------------------------------------------------------------------
-
-
-class _PropAddr(ctypes.Structure):
-    _fields_ = [
-        ("mSelector", ctypes.c_uint32),
-        ("mScope", ctypes.c_uint32),
-        ("mElement", ctypes.c_uint32),
-    ]
-
-
-def _fourcc(s):
-    return int.from_bytes(s.encode("ascii"), "big")
-
-
-_SYS_OBJ = 1
-_S_GLOBAL = _fourcc("glob")
-
-# Per-process audio objects, macOS 14.2+. These selectors are easy to get
-# wrong: input/output are 'piri'/'piro', verified against live playback.
-_P_PROCESSES = _fourcc("prs#")    # kAudioHardwarePropertyProcessObjectList
-_P_PID = _fourcc("ppid")          # kAudioProcessPropertyPID
-_P_BUNDLE_ID = _fourcc("pbid")    # kAudioProcessPropertyBundleID
-_P_RUNNING_IN = _fourcc("piri")   # kAudioProcessPropertyIsRunningInput
-_P_RUNNING_OUT = _fourcc("piro")  # kAudioProcessPropertyIsRunningOutput
-_ELEM_MAIN = 0
-_CF_UTF8 = 0x08000100
-
-
-AudioState = collections.namedtuple(
-    "AudioState", "capturing meeting_app candidates rows")
-
-
-class MicWatcher:
-    """Reports what audio is doing right now, via CoreAudio's per-process API.
-
-    CoreAudio exposes one audio object per process, each carrying
-    kAudioProcessPropertyIsRunningInput/Output, so we can ask "is anything
-    capturing?" and name the culprit by bundle id.
-
-    The obvious alternative is wrong, and this used to use it: per-device
-    kAudioDevicePropertyDeviceIsRunningSomewhere. A USB or Bluetooth headset is
-    a SINGLE audio device carrying both input and output streams, and that
-    property is device-wide with no input scope - so playing music through a
-    headset marks the device as running and read as a meeting. There is no way
-    to tell capture from playback that way, which is why this needs macOS 14.2
-    or newer and switches the mic signal off rather than guess on older ones.
-
-    It cares about capture being live, not about permission or hardware: an app
-    holding mic permission without recording does not register, and connecting
-    a headset only adds an idle device.
-    """
-
-    def __init__(self, proc_ignore=(), meeting_apps=(), app_hold=20.0):
-        self.proc_ignore = [s.lower() for s in proc_ignore]
-        self.meeting_apps = []
-        for pat in meeting_apps:
-            try:
-                self.meeting_apps.append(re.compile(pat, re.I))
-            except re.error:
-                log("bad meeting_apps pattern, ignoring: %r" % pat)
-        self.app_hold = float(app_hold)
-        self._playing_since = {}
-        self.available = False
-        self.process_api = False
-        ca_path = ctypes.util.find_library("CoreAudio")
-        cf_path = ctypes.util.find_library("CoreFoundation")
-        if not ca_path or not cf_path:
-            return
-        self.ca = ctypes.CDLL(ca_path)
-        self.cf = ctypes.CDLL(cf_path)
-        u32 = ctypes.c_uint32
-        self.ca.AudioObjectGetPropertyDataSize.argtypes = [
-            u32, ctypes.POINTER(_PropAddr), u32, ctypes.c_void_p,
-            ctypes.POINTER(u32),
-        ]
-        self.ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
-        self.ca.AudioObjectGetPropertyData.argtypes = [
-            u32, ctypes.POINTER(_PropAddr), u32, ctypes.c_void_p,
-            ctypes.POINTER(u32), ctypes.c_void_p,
-        ]
-        self.ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
-        self.cf.CFStringGetCString.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, u32,
-        ]
-        self.cf.CFStringGetCString.restype = ctypes.c_bool
-        self.cf.CFRelease.argtypes = [ctypes.c_void_p]
-        self.available = True
-        self.process_api = self._size(_SYS_OBJ, _P_PROCESSES, _S_GLOBAL) is not None
-
-    # -- low level helpers --
-
-    def _size(self, obj, selector, scope):
-        addr = _PropAddr(selector, scope, _ELEM_MAIN)
-        size = ctypes.c_uint32(0)
-        err = self.ca.AudioObjectGetPropertyDataSize(
-            obj, ctypes.byref(addr), 0, None, ctypes.byref(size)
-        )
-        return None if err else size.value
-
-    def _get(self, obj, selector, scope, buf, size):
-        addr = _PropAddr(selector, scope, _ELEM_MAIN)
-        io = ctypes.c_uint32(size)
-        err = self.ca.AudioObjectGetPropertyData(
-            obj, ctypes.byref(addr), 0, None, ctypes.byref(io), buf
-        )
-        return err == 0
-
-    def _object_list(self, selector):
-        size = self._size(_SYS_OBJ, selector, _S_GLOBAL)
-        if not size:
-            return []
-        n = size // ctypes.sizeof(ctypes.c_uint32)
-        arr = (ctypes.c_uint32 * n)()
-        if not self._get(_SYS_OBJ, selector, _S_GLOBAL, arr, size):
-            return []
-        return list(arr)
-
-    def _cfstring(self, obj, selector):
-        ref = ctypes.c_void_p()
-        if not self._get(obj, selector, _S_GLOBAL, ctypes.byref(ref),
-                         ctypes.sizeof(ref)) or not ref:
-            return None
-        buf = ctypes.create_string_buffer(512)
-        ok = self.cf.CFStringGetCString(ref, buf, 512, _CF_UTF8)
-        self.cf.CFRelease(ref)
-        return buf.value.decode("utf-8", "replace") if ok else None
-
-    def _flag(self, obj, selector):
-        val = ctypes.c_uint32(0)
-        if not self._get(obj, selector, _S_GLOBAL, ctypes.byref(val),
-                         ctypes.sizeof(val)):
-            return None
-        return bool(val.value)
-
-    # -- per-process view (preferred) --
-
-    def processes(self):
-        """[(name, capturing, playing, ignored)] for processes using audio."""
-        out = []
-        if not self.process_api:
-            return out
-        for proc in self._object_list(_P_PROCESSES):
-            try:
-                name = self._cfstring(proc, _P_BUNDLE_ID)
-                if not name:
-                    pid = ctypes.c_int32(0)
-                    self._get(proc, _P_PID, _S_GLOBAL, ctypes.byref(pid), 4)
-                    name = "pid:%d" % pid.value
-                capturing = self._flag(proc, _P_RUNNING_IN)
-                playing = self._flag(proc, _P_RUNNING_OUT)
-                if capturing is None and playing is None:
-                    continue
-                ignored = any(s in name.lower() for s in self.proc_ignore)
-                out.append((name, bool(capturing), bool(playing), ignored))
-            except OSError:
-                continue
-        return out
-
-    # -- the decision --
-
-    def snapshot(self):
-        """Everything the mic signal needs, from one pass over the processes.
-
-        Capture and meeting-app playback used to be two calls, which meant two
-        full CoreAudio enumerations per poll to answer one question.
-
-        Playback has to persist for app_hold seconds before it counts, or every
-        Slack notification chime would read as a meeting.
-        """
-        rows = self.processes()
-        now = time.time()
-        capturing = None
-        meeting_app = None
-        playing_now = set()
-        for name, is_capturing, is_playing, ignored in rows:
-            if ignored:
-                continue
-            if is_capturing and capturing is None:
-                capturing = name
-            if not is_playing:
-                continue
-            if not any(rx.search(name) for rx in self.meeting_apps):
-                continue
-            playing_now.add(name)
-            since = self._playing_since.setdefault(name, now)
-            if now - since >= self.app_hold and meeting_app is None:
-                meeting_app = name
-        # Forget apps that have stopped, so the next burst starts its own clock.
-        for name in [n for n in self._playing_since if n not in playing_now]:
-            del self._playing_since[name]
-        return AudioState(capturing, meeting_app, sorted(playing_now), rows)
-
-
-# --------------------------------------------------------------------------
-# Signal 2: calendar, via EventKit
-# --------------------------------------------------------------------------
-
-
-# EventKit authorization status codes, for readable diagnostics.
-EK_STATUS = {
-    0: "notDetermined", 1: "restricted", 2: "denied",
-    3: "authorized", 4: "writeOnly", 5: "fullAccess",
-}
-EK_OK = (3, 5)
-
-# EKEventStatusCanceled / EKEventAvailabilityFree / EKParticipantStatusDeclined.
-EK_CANCELLED = 3
-EK_FREE = 1
-EK_DECLINED = 3
-
-
-class EventKitSource:
-    """Reads events straight out of the calendar database via EventKit.
-
-    This is the backend that actually works on current macOS: it sees every
-    account Calendar.app knows about, Exchange/Outlook included, with none of
-    the AppleEvent timeouts the AppleScript route suffers from.
-
-    macOS prompts for calendar access the first time. The grant belongs to the
-    identity of the process that asked, so granting it in a terminal does not
-    grant it to the launchd agent - the agent has to ask for itself, which it
-    can, being a user agent in the GUI session.
-    """
-
-    def __init__(self):
-        self.store = None
-        self.error = None
-        self._ek = None
-        self._nsdate = None
-
-    def _load(self):
-        if self.store is not None:
-            return True
-        try:
-            import EventKit
-            from Foundation import NSDate
-        except ImportError as exc:
-            self.error = ("EventKit bindings missing (%s) - "
-                          "pip install pyobjc-framework-EventKit" % exc)
-            return False
-        self._ek = EventKit
-        self._nsdate = NSDate
-        self.store = EventKit.EKEventStore.alloc().init()
-        return True
-
-    def status(self):
-        """Raw authorization status, or None if the bindings are missing."""
-        if not self._load():
-            return None
-        return self._ek.EKEventStore.authorizationStatusForEntityType_(
-            self._ek.EKEntityTypeEvent
-        )
-
-    def status_name(self):
-        st = self.status()
-        return "unavailable" if st is None else EK_STATUS.get(st, str(st))
-
-    def authorized(self):
-        return self.status() in EK_OK
-
-    def request_access(self, wait=120.0):
-        """Ask for calendar access. MUST be called on the main thread.
-
-        The TCC prompt is presented by the system on the main run loop, so the
-        run loop has to be pumped while we wait - a plain Event.wait() blocks
-        the thread the prompt needs and the request silently never completes.
-        That is why the daemon does this once at startup rather than lazily
-        from the polling thread.
-        """
-        if not self._load():
-            return False
-        st = self.status()
-        if st in EK_OK:
-            return True
-        if st == 2:
-            self.error = ("calendar access denied - turn it back on in System "
-                          "Settings > Privacy & Security > Calendars")
-            return False
-        if st == 1:
-            self.error = "calendar access restricted by policy"
-            return False
-
-        done = threading.Event()
-        result = {}
-
-        def handler(granted, err):
-            result["granted"] = bool(granted)
-            result["error"] = err
-            done.set()
-
-        if hasattr(self.store, "requestFullAccessToEventsWithCompletion_"):
-            self.store.requestFullAccessToEventsWithCompletion_(handler)
-        else:
-            self.store.requestAccessToEntityType_completion_(
-                self._ek.EKEntityTypeEvent, handler
-            )
-
-        from Foundation import NSRunLoop
-        loop = NSRunLoop.currentRunLoop()
-        deadline = time.monotonic() + wait
-        while not done.is_set() and time.monotonic() < deadline:
-            loop.runUntilDate_(self._nsdate.dateWithTimeIntervalSinceNow_(0.25))
-
-        if not done.is_set():
-            self.error = ("no answer to the calendar permission prompt within "
-                          "%.0fs - run --probe from your own terminal and "
-                          "click Allow" % wait)
-            return False
-        if not result.get("granted"):
-            self.error = "calendar access not granted (%s)" % result.get("error")
-            return False
-        self.error = None
-        return True
-
-    def events(self, lead_seconds):
-        """[(title, seconds_until_start, seconds_until_end)] overlapping now..lead."""
-        if not self._load():
-            raise RuntimeError(self.error or "EventKit unavailable")
-        if not self.authorized():
-            raise RuntimeError(
-                self.error or "no calendar access (status: %s) - run --probe "
-                "from a terminal and click Allow" % self.status_name()
-            )
-        start = self._nsdate.date()
-        end = self._nsdate.dateWithTimeIntervalSinceNow_(float(lead_seconds))
-        pred = self.store.predicateForEventsWithStartDate_endDate_calendars_(
-            start, end, None
-        )
-        out = []
-        for ev in (self.store.eventsMatchingPredicate_(pred) or []):
-            try:
-                if ev.isAllDay():
-                    continue
-                if ev.status() == EK_CANCELLED:
-                    continue
-                if ev.availability() == EK_FREE:
-                    continue
-                # A meeting you declined is not a meeting you are in. Exchange
-                # keeps declined invitations on the calendar marked Busy, so
-                # without this they would light the LED red.
-                declined = False
-                for person in (ev.attendees() or []):
-                    if person.isCurrentUser():
-                        declined = person.participantStatus() == EK_DECLINED
-                        break
-                if declined:
-                    continue
-                title = str(ev.title() or "(untitled)")
-                begins = int(ev.startDate().timeIntervalSinceNow())
-                ends = int(ev.endDate().timeIntervalSinceNow())
-                out.append((title, begins, ends))
-            except Exception:
-                continue        # one odd event must not kill the poll
-        return out
-
-
-EVENTKIT = EventKitSource()
 
 
 class CalendarWatcher:
-    """Polls EventKit on a background thread; the main loop reads the cache."""
+    """Polls a calendar source on a background thread; the loop reads a cache.
 
-    def __init__(self, lead_minutes, ignore, poll, verbose=False):
+    The source is injected rather than reached for, so the same polling,
+    caching and filtering serves EventKit on macOS and Outlook on Windows.
+    """
+
+    def __init__(self, source, lead_minutes, ignore, poll, verbose=False):
+        self.source = source
         self.lead = int(lead_minutes) * 60
         self.ignore = [re.compile(p, re.I) for p in ignore]
         self.poll = poll
@@ -531,7 +179,7 @@ class CalendarWatcher:
 
     def refresh(self):
         try:
-            events = [e for e in EVENTKIT.events(self.lead)
+            events = [e for e in self.source.events(self.lead)
                       if not any(rx.search(e[0]) for rx in self.ignore)]
         except Exception as exc:
             self.failures += 1
@@ -561,37 +209,6 @@ class CalendarWatcher:
     def state(self):
         with self._lock:
             return self._current, self._next
-
-
-# --------------------------------------------------------------------------
-# Signal 3: Focus / Do Not Disturb (best effort)
-# --------------------------------------------------------------------------
-
-DND_PATHS = [
-    "~/Library/DoNotDisturb/DB/Assertions.json",
-    "~/Library/Group Containers/group.com.apple.donotdisturb/"
-    "Library/DoNotDisturb/DB/Assertions.json",
-]
-
-
-def dnd_active():
-    """True / False, or None when the OS does not expose it here."""
-    for path in DND_PATHS:
-        p = os.path.expanduser(path)
-        if not os.path.isfile(p):
-            continue
-        try:
-            with open(p) as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        records = data.get("data") or []
-        for rec in records:
-            details = rec.get("storeAssertionRecords") or []
-            if details:
-                return True
-        return False
-    return None
 
 
 # --------------------------------------------------------------------------
@@ -638,7 +255,7 @@ def resolve(cfg, mic, cal):
     if audio and audio.meeting_app:
         return "MEETING", "meeting app audio (%s)" % audio.meeting_app
 
-    if cfg["use_dnd"] and dnd_active():
+    if cfg["use_dnd"] and signals.dnd_active():
         return "BUSY", "do not disturb"
 
     if nxt:
@@ -662,14 +279,34 @@ class SerialLink:
         self._warned = False
 
     def find_port(self):
+        """The configured port, or the first one matching port_match."""
         if self.cfg.get("port"):
             p = self.cfg["port"]
-            return p if os.path.exists(p) else None
-        for pattern in self.cfg["port_globs"]:
-            hits = sorted(glob.glob(pattern))
-            if hits:
-                return hits[0]
-        return None
+            # A COM name is not a filesystem path, so only check existence
+            # where it is one; on Windows, let the open attempt be the test.
+            if os.sep in p or p.startswith("/"):
+                return p if os.path.exists(p) else None
+            return p
+        from serial.tools import list_ports     # pyserial
+
+        patterns = [s.lower() for s in self.cfg["port_match"]]
+        best = None
+        for info in list_ports.comports():
+            ident = "%04x:%04x" % (info.vid, info.pid) if info.vid else ""
+            haystack = " ".join(
+                str(x).lower() for x in
+                (ident, info.device, info.description, info.manufacturer)
+                if x and x != "n/a"
+            )
+            if not any(p in haystack for p in patterns):
+                continue
+            # On macOS the same bridge appears as both /dev/cu.* and
+            # /dev/tty.*; cu is the one that does not block waiting for DCD.
+            if "/dev/tty." in info.device:
+                continue
+            if best is None or info.device < best:
+                best = info.device
+        return best
 
     def connect(self):
         import serial                        # pyserial
@@ -677,8 +314,8 @@ class SerialLink:
         port = self.find_port()
         if not port:
             if not self._warned:
-                log("serial: no Arduino found (globs: %s)"
-                    % ", ".join(self.cfg["port_globs"]))
+                log("serial: no Arduino found (port_match: %s)"
+                    % ", ".join(self.cfg["port_match"]))
                 self._warned = True
             return False
         try:
@@ -735,14 +372,14 @@ def build_mic(cfg):
     """A MicWatcher, or None when the mic signal cannot or should not run."""
     if not cfg["use_mic"]:
         return None
-    mic = MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
-                     cfg["meeting_app_hold"])
+    mic = signals.MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
+                             cfg["meeting_app_hold"])
     if not mic.available:
-        log("mic: CoreAudio unavailable, mic signal off")
+        log("mic: %s unavailable, mic signal off" % signals.AUDIO_API_NAME)
         return None
     if not mic.process_api:
-        log("mic: no per-process audio API (needs macOS 14.2 or newer), "
-            "mic signal off")
+        log("mic: no per-process audio API (%s), mic signal off"
+            % signals.PROCESS_API_HINT)
         return None
     return mic
 
@@ -750,43 +387,47 @@ def build_mic(cfg):
 def build_calendar(cfg):
     """A CalendarWatcher, not yet started, or None. Call on the main thread.
 
-    The permission prompt is presented on the main run loop, so asking has to
-    happen here rather than lazily from the polling thread.
+    Where the platform needs a permission grant, the prompt is presented on
+    the main run loop, so asking has to happen here rather than lazily from
+    the polling thread. On a platform that needs no grant this is a no-op
+    that reports whether the source answered at all.
 
-    A TCC grant is tied to the identity of the process that asked, so a grant
-    given to a terminal run does not carry over to the launchd agent - the
-    agent asks for itself. It can: a user agent runs in the GUI session. What
-    it cannot do is wait two minutes for someone to notice the prompt, so the
-    background wait is short and startup carries on regardless. The mic signal
-    needs no permission and works meanwhile.
+    On macOS a TCC grant is tied to the identity of the process that asked, so
+    a grant given to a terminal run does not carry over to the launchd agent -
+    the agent asks for itself. It can: a user agent runs in the GUI session.
+    What it cannot do is wait two minutes for someone to notice the prompt, so
+    the background wait is short and startup carries on regardless. The mic
+    signal needs no permission and works meanwhile.
     """
     if not cfg["use_calendar"]:
         return None
-    if EVENTKIT.authorized():
-        log("calendar: EventKit access %s" % EVENTKIT.status_name())
+    name = signals.CALENDAR_NAME
+    src = signals.CALENDAR
+    if src.authorized():
+        log("calendar: %s access %s" % (name, src.status_name()))
     else:
         interactive = sys.stdin.isatty()
         wait = cfg["auth_wait"] if interactive else cfg["auth_wait_background"]
-        if EVENTKIT.request_access(wait=wait):
-            log("calendar: EventKit access %s" % EVENTKIT.status_name())
+        if src.request_access(wait=wait):
+            log("calendar: %s access %s" % (name, src.status_name()))
         elif interactive:
-            log("calendar: %s" % EVENTKIT.error)
+            log("calendar: %s" % src.error)
         else:
-            log("calendar: EventKit access is %s after asking for %gs - if no "
+            log("calendar: %s access is %s after asking for %gs - if no "
                 "prompt appeared, run --probe in a terminal; the calendar "
                 "signal is off until it is granted"
-                % (EVENTKIT.status_name(), wait))
-    return CalendarWatcher(cfg["lead_minutes"], cfg["event_ignore"],
+                % (name, src.status_name(), wait))
+    return CalendarWatcher(src, cfg["lead_minutes"], cfg["event_ignore"],
                            cfg["calendar_poll"], verbose=cfg["verbose"])
 
 
 def cmd_probe(cfg):
-    mic = MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
-                     cfg["meeting_app_hold"])
-    print("CoreAudio available: %s" % mic.available)
+    mic = signals.MicWatcher(cfg["proc_ignore"], cfg["meeting_apps"],
+                             cfg["meeting_app_hold"])
+    print("%s available: %s" % (signals.AUDIO_API_NAME, mic.available))
     print("Per-process capture API: %s"
           % ("yes" if mic.process_api
-             else "NO - needs macOS 14.2 or newer; the mic signal is off"))
+             else "NO - %s; the mic signal is off" % signals.PROCESS_API_HINT))
 
     audio = mic.snapshot()
     print("\nProcesses using audio (capture is what decides):")
@@ -802,26 +443,31 @@ def cmd_probe(cfg):
     print("\nmic active: %r" % audio.capturing)
     print("meeting apps playing: %s  (counts after %gs of continuous "
           "playback)" % (", ".join(audio.candidates) or "none", mic.app_hold))
+    # Windows splits capture and playback across two APIs, so the playback
+    # half can be missing on its own. Say so rather than show an empty list.
+    if getattr(mic, "audio_error", None):
+        print("  note: %s" % mic.audio_error)
 
-    print("\nFocus / DND: %r  (None = not readable on this macOS)"
-          % dnd_active())
+    print("\nFocus / DND: %r  (%s)" % (signals.dnd_active(), signals.DND_HINT))
     print("override file %s: %r"
           % (cfg["override_file"], override_state(cfg["override_file"])))
 
-    print("\nEventKit calendar access: %s" % EVENTKIT.status_name())
-    if not EVENTKIT.authorized():
+    src = signals.CALENDAR
+    name = signals.CALENDAR_NAME
+    print("\n%s calendar access: %s" % (name, src.status_name()))
+    if not src.authorized():
         print("Requesting access - a system prompt should appear now...")
-        EVENTKIT.request_access(wait=cfg["auth_wait"])
-        print("EventKit calendar access: %s" % EVENTKIT.status_name())
+        src.request_access(wait=cfg["auth_wait"])
+        print("%s calendar access: %s" % (name, src.status_name()))
 
-    cal = CalendarWatcher(cfg["lead_minutes"], cfg["event_ignore"],
+    cal = CalendarWatcher(src, cfg["lead_minutes"], cfg["event_ignore"],
                           cfg["calendar_poll"], verbose=True)
     print("Querying the calendar...")
     cal.refresh()
     print("  in progress: %r" % (cal.state()[0],))
     print("  next:        %r" % (cal.state()[1],))
-    if EVENTKIT.error:
-        print("  eventkit: %s" % EVENTKIT.error)
+    if src.error:
+        print("  %s: %s" % (name.lower(), src.error))
 
     state, reason = resolve(cfg, mic if cfg["use_mic"] else None, cal)
     print("\n=> %s  (%s)" % (state, reason))
@@ -893,8 +539,23 @@ def main(argv=None):
     ap.add_argument("--send", metavar="STATE", choices=STATES,
                     help="send one state to the Arduino and exit (%s)"
                          % "|".join(STATES))
+    ap.add_argument("--log", metavar="PATH",
+                    help="append all output to PATH instead of stderr "
+                         "(the Windows scheduled task uses this; launchd "
+                         "redirects for itself)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+
+    # Before anything else, so a failure to start is recorded rather than
+    # discarded. log() writes to whatever sys.stderr is at the time, so
+    # pointing stderr at the file catches tracebacks as well as log lines.
+    if args.log:
+        path = os.path.expanduser(args.log)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        sys.stderr = open(path, "a", buffering=1, encoding="utf-8",
+                          errors="replace")
 
     cfg = load_config(args.config)
     if args.verbose:

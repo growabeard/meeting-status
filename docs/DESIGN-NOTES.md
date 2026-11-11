@@ -5,6 +5,9 @@ Most of these were found the hard way.
 
 ## Detection
 
+What to detect is platform-neutral; where the reasoning below names an API it is
+the macOS one. The Windows equivalents are in [Windows](#windows).
+
 ### Microphone: capture, not permission, not connection
 
 The mic signal reads CoreAudio's per-process properties
@@ -115,16 +118,120 @@ the completion handler never fires and the request hangs until it times out.
 The fix is to request on the main thread at startup while pumping
 `NSRunLoop.runUntilDate_`.
 
-A launchd agent cannot display a prompt at all. The daemon therefore checks
-`sys.stdin.isatty()` and only requests access when something is attached to
-prompt on; otherwise it logs that the calendar signal is off and carries on.
-Without that guard, startup under launchd stalls for two minutes waiting for a
-dialog nobody can see.
+A launchd *user* agent can display a prompt - it runs in the GUI session - but
+it cannot afford to wait for one. The daemon checks `sys.stdin.isatty()` and
+uses that only to pick how long to wait: `auth_wait` (120s) in a terminal,
+`auth_wait_background` (25s) under launchd. It starts either way. Waiting the
+full two minutes under launchd would stall startup behind a dialog you may not
+be looking at; not asking at all would mean the agent never gets a grant,
+because a TCC grant belongs to the identity of the process that asked and the
+terminal's grant is not the agent's.
 
 **`flush()` on a serial port can hang forever.** `pyserial`'s `flush()` maps to
 `termios.tcdrain()`, which blocks indefinitely when the far end stops consuming
 bytes — an unpowered or crashed board hangs the daemon. The fix is to never
 call it and rely on `write_timeout` instead.
+
+## Windows
+
+The Arduino side needed nothing: the sketch, the wiring and the serial protocol
+never knew which OS was talking to them. What was macOS-specific was three
+signals, so those moved behind a seam.
+
+**A module per platform, not conditionals.** `meeting_status.py` imports
+`signals_darwin` or `signals_win32` as `signals` based on `sys.platform`, and
+the detection logic contains no OS branches at all. Each module exports the same
+small contract - a `MicWatcher`, a `CALENDAR` source, `dnd_active()`, and the
+`DEFAULT_PROC_IGNORE` / `DEFAULT_MEETING_APPS` lists. `common.py` holds `log()`,
+`AudioState`, `STATES` and the playback debounce, and imports no siblings; it
+exists to break the cycle, since the platform modules need those and
+`meeting_status.py` needs the platform modules.
+
+Four flat modules rather than a package, so launchd and Task Scheduler keep
+invoking a plain script path.
+
+The debounce lives in `common.collapse_audio()` and is shared deliberately. Two
+copies drifting apart would make the light behave differently on the two
+platforms for no visible reason.
+
+**Process defaults are per platform.** `proc_ignore` and `meeting_apps` are
+regexes over process names, and a macOS bundle id (`us\.zoom\.`) matches a
+Windows process name (`Zoom.exe`) never. Shipping one set in
+`config.example.json` would have given a Windows user a working mic signal and
+a silently dead meeting-app signal - the worst shape of failure here, because
+nothing errors. The defaults therefore live in the platform modules and the
+example config does not set either key.
+
+**Mic: the privacy registry, no dependency.** Windows records capture use under
+`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone`,
+in two subtrees: `NonPackaged` for classic exes, whose key names are exe paths
+with `\` mangled to `#`, and direct subkeys for MSIX/Store apps, which is how
+current Teams ships. Each holds `LastUsedTimeStart` and `LastUsedTimeStop` as
+FILETIME QWORDs, and a non-zero `Start` with `Stop == 0` means that app is
+capturing right now. This is the data behind the taskbar mic indicator. It is
+stdlib `winreg`, so the signal that decides the light has no dependency at all.
+`tools/win_probe_mic.py` dumps both subtrees, and for the webcam too as a second
+example of the same pattern; run it idle and again mid-call and diff.
+
+**Playback: WASAPI via pycaw.** `AudioUtilities.GetAllSessions()`, filtered to
+`State == 1`. The exe name comes from the session's `ProcessId` through
+`OpenProcess` + `QueryFullProcessImageNameW` rather than pycaw's `.Process`,
+which would pull in psutil for a name ctypes can get. Capture and playback are
+split across two APIs here, unlike CoreAudio where one call answers both, so the
+playback half can be missing on its own - and it is allowed to be. If pycaw will
+not install, the light still works and only the listen-only-webinar case is
+lost, which is why `setup.ps1` retries without it.
+
+**Calendar: Outlook COM, and three traps.** `comtypes`, not `pywin32`:
+`comtypes` is pure Python and pycaw already depends on it, while `pywin32`
+ships compiled wheels and a new interpreter is a real risk of there not being
+one. No permission grant is involved, so `authorized()` just reports whether
+the dispatch succeeded.
+
+All three traps produce silently wrong results rather than errors:
+
+- `Items.IncludeRecurrences = True` expands a recurring series only if
+  `Items.Sort("[Start]")` was applied **first**. A work calendar is mostly
+  recurring, so the wrong order returns almost nothing and looks like an empty
+  afternoon.
+- `Items.Restrict()` takes a locale-formatted date string, not a datetime.
+- Reading `.Start` on every item of a large mailbox is slow enough to notice, so
+  the window is restricted first and the walk is capped at `MAX_ITEMS`.
+
+A COM object also belongs to the thread that created it, and the source is used
+from the main thread at startup and from the calendar polling thread after that.
+`OutlookSource` keeps its dispatch in `threading.local()` and calls
+`CoInitialize()` per thread.
+
+The four EventKit filters map one-to-one onto Outlook properties, so the
+filtering intent carries over exactly: `isAllDay` → `AllDayEvent`, cancelled →
+`MeetingStatus in (5, 7)`, Free → `BusyStatus == 0`, declined →
+`ResponseStatus == 4`.
+
+**Focus Assist is not read.** It lives in a binary `CloudStore` registry blob
+that Microsoft reshuffles between releases. `dnd_active()` returns `None`, which
+the existing code already treats as "unavailable" and skips - the same call made
+for the macOS DND plist, and for the same reason: a light that lies is worse
+than a signal that is absent.
+
+**`pythonw.exe` has no stderr.** The scheduled task runs `pythonw` to avoid a
+console window, and that leaves `sys.stderr` as `None`, so an unguarded log
+write would crash the daemon rather than merely lose a line. `common.log()`
+returns early in that case, and `--log PATH` points `sys.stderr` at a file
+before anything else runs - Task Scheduler has no equivalent of launchd's
+`StandardErrorPath`, so the daemon has to do its own redirect.
+
+**Task Scheduler is not launchd.** `RestartOnFailure` restarts the task when it
+exits non-zero; it is not `KeepAlive`, which restarts on any exit at all. A
+clean exit stays exited until the next logon. `ExecutionTimeLimit PT0S` is
+needed to stop the default three-day kill, and `Priority 7` is the
+`ProcessType=Background` equivalent. The XML must be UTF-16 to match its own
+declaration or `schtasks /Create /XML` rejects it.
+
+**Serial port lookup, the one change that helped both.** `/dev/cu.*` globs do
+not exist on Windows, where the port is `COM3`. `port_match` now matches
+`serial.tools.list_ports.comports()` on USB VID:PID with a description
+fallback, which is more precise than the globs it replaced on macOS too.
 
 ## The sketch
 

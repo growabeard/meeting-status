@@ -1,2 +1,14 @@
+# Environment markers keep one file for both platforms: pip installs only the
+# lines that apply, so ./setup.sh and setup.ps1 read the same requirements.
 pyserial>=3.5
-pyobjc-framework-EventKit>=10.0
+
+# macOS: EventKit for the calendar. The mic signal uses ctypes against
+# CoreAudio and needs nothing installed.
+pyobjc-framework-EventKit>=10.0; sys_platform == "darwin"
+
+# Windows: comtypes drives Outlook COM for the calendar, pycaw enumerates
+# WASAPI playback sessions for the meeting-app signal. Both are pure Python,
+# unlike pywin32, so neither depends on a compiled wheel existing for the
+# interpreter in use. The mic signal reads the registry via stdlib winreg.
+comtypes>=1.4.0; sys_platform == "win32"
+pycaw>=20240210; sys_platform == "win32"

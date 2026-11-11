@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json and edit. Every key is optional; anything you leave out uses the default in meeting_status.py.",
+  "_comment": "Copy to config.json and edit. Every key is optional; anything you leave out uses the default in meeting_status.py, or - for proc_ignore and meeting_apps, which name processes and so differ per OS - the default in signals_darwin.py or signals_win32.py. Run --probe to see the process names on this machine.",
   "port": null,
   "baud": 115200,
   "mic_poll": 2.0,
@@ -16,20 +16,6 @@
     "\\bwalk time\\b",
     "^ooo\\b",
     "^pto\\b"
-  ],
-  "proc_ignore": [
-    "com.apple.corespeech",
-    "com.apple.assistantd",
-    "com.apple.accessibility.heard",
-    "com.apple.universalaccessd",
-    "com.apple.controlcenter"
-  ],
-  "meeting_apps": [
-    "us\\.zoom\\.",
-    "com\\.microsoft\\.teams",
-    "com\\.tinyspeck\\.slack",
-    "webex|cisco-systems\\.spark",
-    "com\\.google\\.chrome\\.helper\\.meet"
   ],
   "meeting_app_hold": 20.0,
   "use_mic": true,

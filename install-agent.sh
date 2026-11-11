@@ -10,8 +10,13 @@ PLIST=~/Library/LaunchAgents/$LABEL.plist
 [ -x .venv/bin/python ] || { echo "run ./setup.sh first"; exit 1; }
 [ -f config.json ] || cp config.example.json config.json
 
-# Grant calendar access interactively before launchd ever starts it: a launchd
-# agent cannot display a permission prompt, so it would silently never get one.
+# Ask for calendar access here, in a terminal, before launchd ever starts it.
+# Not because the agent cannot prompt - a launchd *user* agent runs in the GUI
+# session and can - but because a TCC grant belongs to the identity that asked,
+# so the agent has to ask again for itself anyway, and it can only afford to
+# wait auth_wait_background seconds for an answer. Doing it here means the
+# prompt arrives while you are sitting in front of it, and this run also
+# surfaces a broken config with its error on screen.
 if ! ./.venv/bin/python meeting_status.py --once --no-serial >/dev/null 2>&1; then
   echo "warning: a --once run failed; check ./.venv/bin/python meeting_status.py --probe"
 fi
