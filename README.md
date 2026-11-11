@@ -88,6 +88,30 @@ Five signals, highest precedence first. Full reasoning in
 5. **Focus / DND** — best effort. macOS moves this file between releases; when
    unreadable the signal is skipped silently.
 
+## Overriding it by hand
+
+The override is a file, so anything that can write a file can drive the light.
+`bin/ms` wraps it:
+
+```sh
+./bin/ms            # what the light is doing, and why
+./bin/ms meeting    # force red - busy / free / off / upcoming also work
+./bin/ms auto       # back to automatic
+./bin/ms log        # follow the daemon log
+```
+
+Add `bin` to your `PATH` to drop the `./`. Or skip the script entirely:
+
+```sh
+echo MEETING > ~/.meeting-status    # force a state
+rm ~/.meeting-status                # back to automatic
+```
+
+The override beats every other signal, including the mic, so `FREE` holds green
+through a real call. Writing `AUTO`, `NONE` or `CLEAR` is the same as deleting
+the file. An unrecognised value is ignored and detection carries on, so a typo
+fails safe. The daemon picks up a change on its next poll, about a second.
+
 ## Run it in the background
 
 ```sh
@@ -178,6 +202,7 @@ sending.
 
 ```
 meeting_status.py                      the host agent (single file, stdlib + pyserial + PyObjC)
+bin/ms                                 read and override the light from the shell
 arduino/meeting_status_led/            the sketch
 config.example.json                    config template
 setup.sh                               create the venv

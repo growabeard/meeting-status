@@ -1,0 +1,40 @@
+#!/bin/zsh
+# Read and override the meeting light. No daemon, no port: the override is
+# just a file, and the daemon notices it on its next poll.
+#
+#   ms              what the light is doing and why
+#   ms meeting      force red   (busy / off / free / upcoming also work)
+#   ms auto         back to automatic detection
+#   ms log          follow the daemon log
+set -e
+DIR=${0:a:h:h}
+OVERRIDE=~/.meeting-status
+LOG=~/Library/Logs/meeting-status.log
+
+case ${1:-status} in
+  status)
+    if [ -f $OVERRIDE ]; then
+      print "override: $(<$OVERRIDE)  (ms auto to clear)"
+    else
+      print "override: none"
+    fi
+    # The daemon logs every state change, so the last state line is current.
+    print "light:    $(grep -E '^[0-9-]+ [0-9:]+  [A-Z]+  (<-|\.\.)' $LOG 2>/dev/null | tail -1 | sed 's/^[0-9: -]*//' || print unknown)"
+    launchctl list | grep -q local.meetingstatus || print "agent:    NOT RUNNING"
+    ;;
+  auto|clear|none)
+    rm -f $OVERRIDE
+    print "override cleared - back to automatic"
+    ;;
+  log)
+    exec tail -f $LOG
+    ;;
+  meeting|busy|free|off|upcoming|MEETING|BUSY|FREE|OFF|UPCOMING)
+    print ${1:u} > $OVERRIDE
+    print "forced ${1:u} - ms auto to clear"
+    ;;
+  *)
+    print -u2 "usage: ms [status|meeting|busy|free|off|upcoming|auto|log]"
+    exit 2
+    ;;
+esac
