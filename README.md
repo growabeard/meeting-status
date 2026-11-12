@@ -10,7 +10,7 @@ meeting and tells an Arduino, which shows it on an RGB LED.
 | solid red | `MEETING` | audio is being captured, or an event is happening now |
 | solid purple | `BUSY` | Focus / Do Not Disturb is on (macOS only) |
 | breathing dim blue | *stale* | the board has heard nothing from the host for 20s |
-| dark | `OFF` | the agent shut down cleanly |
+| dark | `OFF` | the agent shut down cleanly, or has been silent for 10 minutes |
 
 No cloud service, no API tokens, no Teams or Slack integration. Detection is
 local: who is capturing audio, and what the calendar says.

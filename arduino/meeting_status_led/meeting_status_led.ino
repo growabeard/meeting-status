@@ -40,6 +40,13 @@
  * The host sends a STAT line every few seconds as a heartbeat. If nothing
  * arrives for STALE_MS the board decides the host is gone and breathes blue,
  * so a dead script looks different from "free".
+ *
+ * Blue is for the case where someone is there to see it. After STALE_DARK_MS
+ * of silence the board gives up and goes dark instead, because a dock keeps
+ * supplying USB power with no host attached - so an undocked laptop overnight
+ * would otherwise leave the thing pulsing blue at an empty desk until morning.
+ * The board still answers "?" with STALE while dark, so the distinction is
+ * kept where it costs nothing.
  */
 
 #include <Arduino.h>
@@ -60,6 +67,9 @@ const uint8_t PIN_B = 2;
 
 const unsigned long BAUD      = 115200;
 const unsigned long STALE_MS  = 20000;  // no host traffic for this long = stale
+// Long enough that a daemon restart or a brief sleep still shows blue while you
+// are sitting there, short enough that it does not glow all night.
+const unsigned long STALE_DARK_MS = 600000UL;  // 10 min stale = go dark
 const unsigned int  FADE_MS   = 8;      // ms per fade step between colours
 const uint8_t       FADE_STEP = 4;      // channel units per fade step
 
@@ -96,6 +106,7 @@ const uint8_t IDX_STALE = 5;
 
 uint8_t  currentIdx = IDX_STALE;   // what the host last told us
 bool     stale      = true;
+bool     darkened   = false;       // stale so long the board stopped showing it
 bool     manual     = false;       // an RGB command is overriding the status
 uint8_t  manualR = 0, manualG = 0, manualB = 0;
 
@@ -170,6 +181,10 @@ void setTargetFromState() {
     tgtR = manualR; tgtG = manualG; tgtB = manualB;
     return;
   }
+  if (stale && darkened) {
+    tgtR = 0; tgtG = 0; tgtB = 0;
+    return;
+  }
   const Status &s = STATUSES[stale ? IDX_STALE : currentIdx];
   tgtR = s.r; tgtG = s.g; tgtB = s.b;
 }
@@ -185,7 +200,8 @@ void stepToward(uint8_t &value, uint8_t target) {
 void render() {
   uint8_t mod = 255;
   if (!manual) {
-    if (STATUSES[stale ? IDX_STALE : currentIdx].effect == BREATHE_SLOW) {
+    if (!(stale && darkened) &&
+        STATUSES[stale ? IDX_STALE : currentIdx].effect == BREATHE_SLOW) {
       mod = breathe(4000);
     }
   }
@@ -223,6 +239,7 @@ void handleLine(char *buf) {
     }
     lastHostMs = millis();
     stale = false;
+    darkened = false;
     manual = false;
     currentIdx = (uint8_t)idx;
     setTargetFromState();
@@ -232,6 +249,7 @@ void handleLine(char *buf) {
   } else if (strcasecmp(cmd, "PING") == 0) {
     lastHostMs = millis();
     stale = false;
+    darkened = false;
     Serial.println(F("PONG"));
 
   } else if (strcasecmp(cmd, "BRIGHT") == 0) {
@@ -253,6 +271,7 @@ void handleLine(char *buf) {
     manualB = (uint8_t)constrain(atol(c), 0, 255);
     lastHostMs = millis();
     stale = false;
+    darkened = false;
     setTargetFromState();
     Serial.println(F("OK RGB"));
 
@@ -305,6 +324,7 @@ void setup() {
   lastHostMs = millis();
   currentIdx = IDX_FREE;
   stale = true;
+  darkened = false;
   setTargetFromState();
 
   Serial.println(F("READY meeting_status_led"));
@@ -316,6 +336,13 @@ void loop() {
   if (!stale && (millis() - lastHostMs) > STALE_MS) {
     stale = true;
     manual = false;
+    darkened = false;
+    setTargetFromState();
+  }
+
+  // Still nobody after a long while: stop advertising it and fade out.
+  if (stale && !darkened && (millis() - lastHostMs) > STALE_DARK_MS) {
+    darkened = true;
     setTargetFromState();
   }
 

@@ -46,6 +46,13 @@ The host resends the current state every `heartbeat` seconds (5 by default) to
 hold it off. **Any value of `heartbeat` must stay well under 20 seconds**, or
 the LED will flick to blue between updates.
 
+After `STALE_DARK_MS` (10 minutes) of continued silence the board goes dark
+instead. Blue answers "is the host still there?", which is only a question
+while someone is at the desk to ask it; a dock keeps the board powered with no
+host attached, so without this an undocked laptop leaves it pulsing at an empty
+desk overnight. The board still reports `STALE` in reply to `?` while dark, and
+any `STAT`, `PING` or `RGB` brings the colour straight back.
+
 ## Talking to the board by hand
 
 ```sh

@@ -257,6 +257,16 @@ The cost: the sketch owns Timer2, so `tone()` will not work alongside it. On a
 non-ATmega328P board the register names will not compile — move the LED to
 three hardware PWM pins and revert to `analogWrite`.
 
+**Stale is two stages, not one.** Twenty seconds of silence turns the LED
+breathing blue, and ten minutes of it turns the LED off. The first stage exists
+so a crashed daemon cannot masquerade as `FREE` - a dead script leaving a green
+light saying "come on in" is the one failure that actively misleads people. The
+second exists because that reasoning expires: a dock supplies USB power with no
+host attached, so the board boots alone and reports a missing host perfectly
+correctly at an empty desk all night. Blue is only information while someone is
+there to read it. The board keeps answering `?` with `STALE` while dark, so
+nothing diagnostic is lost - only the glow.
+
 **Non-blocking.** No `delay()` in `loop()`. Fades, breathing and the stale
 watchdog all run off `millis()` so serial is never missed.
 
